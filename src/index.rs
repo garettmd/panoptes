@@ -358,7 +358,11 @@ pub fn build_with_jobs(
                 continue;
             }
 
-            match extract::resolve(&by_name, from_id, &call.callee) {
+            match if file.lang == Lang::Hcl {
+                resolve_hcl_callee(&by_name, from_id, &call.callee)
+            } else {
+                extract::resolve(&by_name, from_id, &call.callee)
+            } {
                 Some(target) => {
                     n_edges += insert_edge
                         .execute(rusqlite::params![repo_id, from_id, target, "calls"])?;
@@ -717,6 +721,21 @@ fn resolve_import(
                 normalize_path(Path::new(spec)),
             ]
         }
+        Lang::Hcl => {
+            if !(spec.starts_with("./") || spec.starts_with("../")) {
+                return Vec::new();
+            }
+            let dir = normalize_path(&from_dir.join(spec));
+            let mut ids: Vec<i64> = files
+                .iter()
+                .filter(|(path, _)| {
+                    Path::new(path.as_str()).parent().unwrap_or(Path::new("")) == Path::new(&dir)
+                })
+                .map(|(_, id)| *id)
+                .collect();
+            ids.sort_unstable();
+            return ids;
+        }
         Lang::Yaml => {
             if !spec.starts_with('.') {
                 return Vec::new();
@@ -737,6 +756,26 @@ fn resolve_import(
         }
     }
     Vec::new()
+}
+
+/// Terraform refs often include a computed suffix (`aws_instance.web.id`).
+/// Exact match first, then strip trailing segments until a unique symbol hits.
+fn resolve_hcl_callee(
+    by_name: &HashMap<String, Vec<i64>>,
+    from_id: i64,
+    callee: &str,
+) -> Option<i64> {
+    if let Some(target) = extract::resolve(by_name, from_id, callee) {
+        return Some(target);
+    }
+    let mut current = callee;
+    while let Some((prefix, _)) = current.rsplit_once('.') {
+        if let Some(target) = extract::resolve(by_name, from_id, prefix) {
+            return Some(target);
+        }
+        current = prefix;
+    }
+    None
 }
 
 fn resolve_rust_import(from_rel: &str, spec: &str, files: &HashMap<String, i64>) -> Vec<i64> {
@@ -1712,6 +1751,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(yaml_keys, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hcl_module_imports_and_address_references_resolve() {
+        let (db, root) = fixture(&[
+            (
+                "main.tf",
+                r#"
+module "vpc" {
+  source = "./modules/vpc"
+}
+
+resource "aws_instance" "web" {
+  ami = var.names
+}
+"#,
+            ),
+            ("variables.tf", "variable \"names\" {}\n"),
+            (
+                "modules/vpc/main.tf",
+                "resource \"aws_s3_bucket\" \"data\" {}\n",
+            ),
+            ("modules/vpc/variables.tf", "variable \"cidr\" {}\n"),
+            (
+                "outputs.tf",
+                "output \"id\" {\n  value = aws_instance.web.id\n}\n",
+            ),
+            (
+                "remote.tf",
+                "module \"registry\" {\n  source = \"hashicorp/consul/aws\"\n}\n",
+            ),
+        ]);
+        let id = repo_id_of(&db, &root).unwrap().unwrap();
+
+        let edge_count = |kind: &str, source: &str, target: &str| -> i64 {
+            db.query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind=?2
+                    and src.name=?3 and dst.name=?4",
+                rusqlite::params![id, kind, source, target],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(edge_count("imports", "main.tf", "modules/vpc/main.tf"), 1);
+        assert_eq!(
+            edge_count("imports", "main.tf", "modules/vpc/variables.tf"),
+            1
+        );
+        let registry: i64 = db
+            .query_row(
+                "select count(*) from edges e
+                   join symbols src on src.id=e.src_symbol_id
+                   join symbols dst on dst.id=e.dst_symbol_id
+                  where e.repo_id=?1 and e.kind='imports'
+                    and src.name='remote.tf' and dst.kind='module'",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registry, 1, "registry sources stay external module rows");
+        assert_eq!(edge_count("calls", "aws_instance.web.ami", "var.names"), 1);
+        assert_eq!(
+            edge_count("calls", "output.id.value", "aws_instance.web"),
+            1
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
